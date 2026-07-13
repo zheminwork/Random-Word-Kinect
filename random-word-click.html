@@ -1,0 +1,533 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Random Word Click</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Roboto+Flex:opsz,wght@8..144,100..1000&display=swap" rel="stylesheet">
+  <style>
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: #000;
+      cursor: crosshair;
+      user-select: none;
+    }
+
+    canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+      background: #000;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="stage" aria-label="Click to release random word characters"></canvas>
+
+  <script src="https://cdn.jsdelivr.net/npm/matter-js@0.20.0/build/matter.min.js"></script>
+  <script>
+    const fallbackWords = [
+      "POWER",
+      "HEGEMONY",
+      "DOMINANCE",
+      "HIERARCHY",
+      "CONTROL",
+      "AUTHORITY",
+      "INSTITUTION",
+      "STRUCTURE",
+      "SYSTEMIC",
+      "STRUCTURAL"
+    ];
+
+    const canvas = document.getElementById("stage");
+    const ctx = canvas.getContext("2d");
+    const hullCanvas = document.createElement("canvas");
+    const hullCtx = hullCanvas.getContext("2d", { willReadFrequently: true });
+    const letters = [];
+    const { Bodies, Body, Composite, Engine, Events } = Matter;
+    const engine = Engine.create();
+    const world = engine.world;
+
+    world.gravity.y = 0;
+    engine.positionIterations = 12;
+    engine.velocityIterations = 10;
+    engine.constraintIterations = 4;
+
+    const maxGravityForce = 0.00115;
+    const maxBuoyancyForce = -0.00115;
+    const wallThickness = 120;
+    const maxWeight = 1000;
+    const minWeight = 250;
+    const collisionWeight = 550;
+    const letterSize = 76;
+    const weightFadeDelay = 1000;
+    const weightFadeDuration = 4000;
+    const hullSampleStep = 4;
+    const hullAlphaThreshold = 32;
+    const physicsStep = 1000 / 90;
+    const maxPhysicsSubsteps = 3;
+    const wordBankPath = "word-bank.txt";
+    const wordBankReloadInterval = 1500;
+    const emitInterval = 180;
+    const incompleteWordColor = "#777";
+    const completedWordColor = "#fff";
+    const completedFlashDuration = 900;
+    const completedFlashShadowBlur = 18;
+    const completedShadowBlur = 6;
+    const completedShadowOffsetX = 3;
+    const completedShadowOffsetY = 4;
+    const completedShadowShadowColor = "rgba(0, 0, 0, 0.92)";
+    const enableLetterShadow = true;
+    const letterShadowBlur = 8;
+    const letterShadowOffsetX = 0;
+    const letterShadowOffsetY = 0;
+    const letterShadowColor = "rgba(255, 255, 255, 0.28)";
+    const showDebugWeight = false;
+
+    let words = [...fallbackWords];
+    let walls = [];
+    let activeWord = "";
+    let activeWordGroup = null;
+    let letterIndex = 0;
+    let width = 0;
+    let height = 0;
+    let dpr = 1;
+    let nextLetterId = 1;
+    let nextWordGroupId = 1;
+    let lastTime = performance.now();
+    let physicsAccumulator = 0;
+    let pointerIsDown = false;
+    let lastEmitTime = -Infinity;
+    let pointer = { x: 0, y: 0 };
+
+    function parseWordBank(text) {
+      const parsed = text
+        .split(/\r?\n/)
+        .map((line) => line.replace(/（.*?）|\(.*?\)/g, "").trim())
+        .filter(Boolean)
+        .map((word) => word.toUpperCase());
+
+      return parsed.length ? parsed : fallbackWords;
+    }
+
+    async function loadWordBank() {
+      try {
+        const response = await fetch(`${wordBankPath}?t=${Date.now()}`, {
+          cache: "no-store"
+        });
+
+        if (!response.ok) {
+          return;
+        }
+
+        words = parseWordBank(await response.text());
+      } catch (error) {
+        words = [...fallbackWords];
+      }
+    }
+
+    function chooseWord() {
+      let next = words[Math.floor(Math.random() * words.length)];
+      if (words.length > 1) {
+        while (next === activeWord) {
+          next = words[Math.floor(Math.random() * words.length)];
+        }
+      }
+
+      activeWord = next;
+      letterIndex = 0;
+      activeWordGroup = {
+        id: nextWordGroupId,
+        word: activeWord,
+        completed: false,
+        completedAt: null
+      };
+      nextWordGroupId += 1;
+    }
+
+    function resize() {
+      dpr = window.devicePixelRatio || 1;
+      width = window.innerWidth;
+      height = window.innerHeight;
+      canvas.width = Math.floor(width * dpr);
+      canvas.height = Math.floor(height * dpr);
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      rebuildWalls();
+    }
+
+    function releaseLetter(x, y) {
+      if (!activeWord || letterIndex >= activeWord.length) {
+        chooseWord();
+      }
+
+      const character = activeWord[letterIndex];
+      letterIndex += 1;
+
+      if (letterIndex >= activeWord.length) {
+        activeWordGroup.completed = true;
+        activeWordGroup.completedAt = engine.timing.timestamp;
+        setTimeout(chooseWord, 0);
+      }
+
+      const letter = {
+        id: nextLetterId,
+        character,
+        body: null,
+        wordGroup: activeWordGroup,
+        size: letterSize,
+        width: 40,
+        height: 60,
+        vertices: [],
+        weight: minWeight,
+        mass: massForWeight(minWeight),
+        age: 0,
+        bornAt: engine.timing.timestamp
+      };
+
+      nextLetterId += 1;
+      updateBounds(letter);
+      letter.body = createLetterBody(letter, x, y, (Math.random() - 0.5) * 0.65);
+      Composite.add(world, letter.body);
+      letters.push(letter);
+    }
+
+    function setCanvasFont(item, targetCtx = ctx, weight = item.weight) {
+      targetCtx.font = `${weight} ${item.size}px "Roboto Flex", Arial, sans-serif`;
+    }
+
+    function updateBounds(item) {
+      setCanvasFont(item, ctx, collisionWeight);
+      const metrics = ctx.measureText(item.character);
+      const measuredWidth = metrics.actualBoundingBoxLeft + metrics.actualBoundingBoxRight;
+      const measuredHeight = metrics.actualBoundingBoxAscent + metrics.actualBoundingBoxDescent;
+      const width = measuredWidth || metrics.width || item.size * 0.5;
+      const height = measuredHeight || item.size * 0.8;
+
+      item.width = Math.max(12, width);
+      item.height = Math.max(20, height);
+      item.vertices = createLetterHull(item, collisionWeight);
+    }
+
+    function createLetterBody(item, x, y, angle, velocity = { x: 0, y: 0 }, angularVelocity = 0) {
+      const body = Bodies.fromVertices(x, y, [item.vertices], {
+        angle,
+        friction: 0.62,
+        frictionAir: 0.045,
+        frictionStatic: 0.85,
+        restitution: 0.82,
+        label: "letter"
+      }, true);
+
+      body.plugin.letter = item;
+      item.mass = massForWeight(item.weight);
+      Body.setMass(body, item.mass);
+      Body.setVelocity(body, velocity);
+      Body.setAngularVelocity(body, angularVelocity);
+      return body;
+    }
+
+    function replaceLetterBody(item) {
+      if (!item.body) {
+        return;
+      }
+
+      const { position, angle, velocity, angularVelocity } = item.body;
+      const nextBody = createLetterBody(item, position.x, position.y, angle, velocity, angularVelocity);
+      Composite.remove(world, item.body);
+      item.body = nextBody;
+      Composite.add(world, item.body);
+    }
+
+    function createLetterHull(item, weight = collisionWeight) {
+      const canvasSize = Math.ceil(item.size * 2.8);
+      const center = canvasSize / 2;
+      hullCanvas.width = canvasSize;
+      hullCanvas.height = canvasSize;
+      hullCtx.clearRect(0, 0, canvasSize, canvasSize);
+      setCanvasFont(item, hullCtx, weight);
+      hullCtx.textAlign = "center";
+      hullCtx.textBaseline = "middle";
+      hullCtx.fillStyle = "#fff";
+      hullCtx.fillText(item.character, center, center);
+
+      const image = hullCtx.getImageData(0, 0, canvasSize, canvasSize).data;
+      const points = [];
+
+      for (let y = 0; y < canvasSize; y += hullSampleStep) {
+        for (let x = 0; x < canvasSize; x += hullSampleStep) {
+          const alpha = image[(y * canvasSize + x) * 4 + 3];
+          if (alpha <= hullAlphaThreshold || !isBoundaryPixel(image, canvasSize, x, y)) {
+            continue;
+          }
+
+          points.push({ x: x - center, y: y - center });
+        }
+      }
+
+      return convexHull(points);
+    }
+
+    function isBoundaryPixel(image, canvasSize, x, y) {
+      const neighbors = [
+        [x - hullSampleStep, y],
+        [x + hullSampleStep, y],
+        [x, y - hullSampleStep],
+        [x, y + hullSampleStep]
+      ];
+
+      return neighbors.some(([nx, ny]) => {
+        if (nx < 0 || nx >= canvasSize || ny < 0 || ny >= canvasSize) {
+          return true;
+        }
+
+        return image[(ny * canvasSize + nx) * 4 + 3] <= hullAlphaThreshold;
+      });
+    }
+
+    function convexHull(points) {
+      if (points.length < 3) {
+        return [
+          { x: -6, y: -10 },
+          { x: 6, y: -10 },
+          { x: 6, y: 10 },
+          { x: -6, y: 10 }
+        ];
+      }
+
+      const sorted = [...points].sort((a, b) => a.x - b.x || a.y - b.y);
+      const lower = [];
+      const upper = [];
+
+      for (const point of sorted) {
+        while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], point) <= 0) {
+          lower.pop();
+        }
+        lower.push(point);
+      }
+
+      for (let i = sorted.length - 1; i >= 0; i -= 1) {
+        const point = sorted[i];
+        while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], point) <= 0) {
+          upper.pop();
+        }
+        upper.push(point);
+      }
+
+      const hull = lower.slice(0, -1).concat(upper.slice(0, -1));
+      return hull.length >= 3 ? hull : [
+        { x: -6, y: -10 },
+        { x: 6, y: -10 },
+        { x: 6, y: 10 },
+        { x: -6, y: 10 }
+      ];
+    }
+
+    function cross(origin, a, b) {
+      return (a.x - origin.x) * (b.y - origin.y) - (a.y - origin.y) * (b.x - origin.x);
+    }
+
+    function massForWeight(weight) {
+      const normalized = (weight - minWeight) / (maxWeight - minWeight);
+      return 0.9 + Math.max(0, Math.min(1, normalized)) * 6.1;
+    }
+
+    function forceForWeight(weight) {
+      const normalized = (weight - minWeight) / (maxWeight - minWeight);
+      const t = Math.max(0, Math.min(1, normalized));
+      return maxBuoyancyForce + (maxGravityForce - maxBuoyancyForce) * t;
+    }
+
+    function smoothstep(value) {
+      const t = Math.max(0, Math.min(1, value));
+      return t * t * (3 - 2 * t);
+    }
+
+    function weightForAge(ageMs) {
+      const progress = smoothstep((ageMs - weightFadeDelay) / weightFadeDuration);
+      return minWeight + (maxWeight - minWeight) * progress;
+    }
+
+    function updateWeightForAge(item) {
+      const nextWeight = weightForAge(engine.timing.timestamp - item.bornAt);
+
+      if (Math.abs(nextWeight - item.weight) < 1) {
+        return;
+      }
+
+      item.weight = nextWeight;
+      item.mass = massForWeight(item.weight);
+
+      if (item.body) {
+        Body.setMass(item.body, item.mass);
+      }
+    }
+
+    function applyLetterVisualStyle(item) {
+      const group = item.wordGroup;
+
+      if (group?.completed) {
+        const completedAge = engine.timing.timestamp - group.completedAt;
+        if (completedAge < completedFlashDuration) {
+          const progress = Math.max(0, Math.min(1, completedAge / completedFlashDuration));
+          const glow = Math.sin(progress * Math.PI);
+          ctx.fillStyle = completedWordColor;
+          if (enableLetterShadow) {
+            ctx.shadowColor = `rgba(255, 255, 255, ${0.72 * glow})`;
+            ctx.shadowBlur = completedFlashShadowBlur * glow;
+            ctx.shadowOffsetX = 0;
+            ctx.shadowOffsetY = 0;
+          }
+          return;
+        }
+
+        ctx.fillStyle = completedWordColor;
+        if (enableLetterShadow) {
+          ctx.shadowColor = completedShadowShadowColor;
+          ctx.shadowBlur = completedShadowBlur;
+          ctx.shadowOffsetX = completedShadowOffsetX;
+          ctx.shadowOffsetY = completedShadowOffsetY;
+        }
+        return;
+      }
+
+      ctx.fillStyle = incompleteWordColor;
+    }
+
+    function drawLetter(item) {
+      const { position, angle } = item.body;
+      ctx.save();
+      ctx.globalAlpha = 1;
+      ctx.translate(position.x, position.y);
+      ctx.rotate(angle);
+      setCanvasFont(item);
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      applyLetterVisualStyle(item);
+      ctx.fillText(item.character, 0, 0);
+
+      if (showDebugWeight) {
+        ctx.font = `500 12px "Roboto Flex", Arial, sans-serif`;
+        ctx.fillText(Math.round(item.weight), 0, item.height * 0.72);
+      }
+
+      ctx.restore();
+    }
+
+    function rebuildWalls() {
+      if (walls.length) {
+        Composite.remove(world, walls);
+      }
+
+      walls = [
+        Bodies.rectangle(width / 2, height + wallThickness / 2, width + wallThickness * 2, wallThickness, { isStatic: true, label: "wall" }),
+        Bodies.rectangle(width / 2, -wallThickness / 2, width + wallThickness * 2, wallThickness, { isStatic: true, label: "wall" }),
+        Bodies.rectangle(-wallThickness / 2, height / 2, wallThickness, height + wallThickness * 2, { isStatic: true, label: "wall" }),
+        Bodies.rectangle(width + wallThickness / 2, height / 2, wallThickness, height + wallThickness * 2, { isStatic: true, label: "wall" })
+      ];
+
+      Composite.add(world, walls);
+    }
+
+    function applyLetterForces() {
+      for (const item of letters) {
+        item.age += 1;
+        updateWeightForAge(item);
+        Body.applyForce(item.body, item.body.position, {
+          x: 0,
+          y: forceForWeight(item.weight) * item.body.mass
+        });
+      }
+    }
+
+    function animate() {
+      const now = performance.now();
+      const delta = Math.min(50, now - lastTime);
+      lastTime = now;
+      physicsAccumulator += delta;
+
+      if (pointerIsDown && now - lastEmitTime >= emitInterval) {
+        releaseLetter(pointer.x, pointer.y);
+        lastEmitTime = now;
+      }
+
+      let substeps = 0;
+      while (physicsAccumulator >= physicsStep && substeps < maxPhysicsSubsteps) {
+        applyLetterForces();
+        Engine.update(engine, physicsStep);
+        physicsAccumulator -= physicsStep;
+        substeps += 1;
+      }
+
+      if (substeps === maxPhysicsSubsteps) {
+        physicsAccumulator = 0;
+      }
+
+      ctx.clearRect(0, 0, width, height);
+
+      for (let i = letters.length - 1; i >= 0; i -= 1) {
+        const item = letters[i];
+        drawLetter(item);
+      }
+
+      requestAnimationFrame(animate);
+    }
+
+    function pointerPosition(event) {
+      const rect = canvas.getBoundingClientRect();
+      return {
+        x: event.clientX - rect.left,
+        y: event.clientY - rect.top
+      };
+    }
+
+    canvas.addEventListener("pointerdown", (event) => {
+      pointer = pointerPosition(event);
+      pointerIsDown = true;
+      lastEmitTime = -Infinity;
+      canvas.setPointerCapture(event.pointerId);
+      releaseLetter(pointer.x, pointer.y);
+      lastEmitTime = performance.now();
+    });
+
+    canvas.addEventListener("pointermove", (event) => {
+      pointer = pointerPosition(event);
+    });
+
+    canvas.addEventListener("pointerup", (event) => {
+      pointerIsDown = false;
+      canvas.releasePointerCapture(event.pointerId);
+    });
+
+    canvas.addEventListener("pointercancel", () => {
+      pointerIsDown = false;
+    });
+
+    window.addEventListener("blur", () => {
+      pointerIsDown = false;
+    });
+
+    if (document.fonts) {
+      document.fonts.ready.then(() => {
+        for (const item of letters) {
+          updateBounds(item);
+          replaceLetterBody(item);
+        }
+      });
+    }
+
+    window.addEventListener("resize", resize);
+
+    loadWordBank().then(chooseWord);
+    setInterval(loadWordBank, wordBankReloadInterval);
+    resize();
+    animate();
+  </script>
+</body>
+</html>
+
